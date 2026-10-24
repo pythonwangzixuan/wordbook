@@ -8,7 +8,7 @@ const crypto = require("crypto");
 const { spawn } = require("child_process");
 
 const ROOT = __dirname;
-const PORT = Number(process.argv[2]) || 8765;
+const PORT = Number(process.env.PORT) || Number(process.argv[2]) || 8765;
 const MAX_UPLOAD = 60 * 1024 * 1024;
 const MAX_JSON = 20 * 1024 * 1024;
 const MIME = {
@@ -31,7 +31,8 @@ function readDbConfig() {
       port: Number(process.env.MYSQL_PORT) || 3306,
       user: process.env.MYSQL_USER,
       password: process.env.MYSQL_PASS || "",
-      database: process.env.MYSQL_DB || "wordbook"
+      database: process.env.MYSQL_DB || "wordbook",
+      ssl: process.env.MYSQL_SSL === "true"
     };
   }
   try {
@@ -43,7 +44,8 @@ function readDbConfig() {
       port: Number(cfg.port) || 3306,
       user: cfg.user,
       password: cfg.password || "",
-      database: cfg.database || "wordbook"
+      database: cfg.database || "wordbook",
+      ssl: cfg.ssl === true
     };
   } catch (e) { return null; }
 }
@@ -64,7 +66,8 @@ async function initDb() {
   try {
     pool = mysql.createPool({
       host: DB_CFG.host, port: DB_CFG.port, user: DB_CFG.user, password: DB_CFG.password,
-      database: DB_CFG.database, connectionLimit: 6, charset: "utf8mb4", waitForConnections: true
+      database: DB_CFG.database, connectionLimit: 6, charset: "utf8mb4", waitForConnections: true,
+      ssl: DB_CFG.ssl ? { minVersion: "TLSv1.2", rejectUnauthorized: true } : undefined
     });
     await pool.query("SELECT 1");
     await pool.query(`CREATE TABLE IF NOT EXISTS users(
