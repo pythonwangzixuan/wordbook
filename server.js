@@ -132,12 +132,17 @@ function readCookies(req) {
   }
   return out;
 }
-function setSessionCookie(res, token) {
-  res.setHeader("Set-Cookie",
-    `${COOKIE_NAME}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_DAYS * 86400}`);
+function isHttps(req) {
+  return String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim() === "https";
 }
-function clearSessionCookie(res) {
-  res.setHeader("Set-Cookie", `${COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
+function setSessionCookie(req, res, token) {
+  res.setHeader("Set-Cookie",
+    `${COOKIE_NAME}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_DAYS * 86400}` +
+    (isHttps(req) ? "; Secure" : ""));
+}
+function clearSessionCookie(req, res) {
+  res.setHeader("Set-Cookie",
+    `${COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0` + (isHttps(req) ? "; Secure" : ""));
 }
 async function createSession(userId) {
   const token = crypto.randomBytes(32).toString("hex");
@@ -158,6 +163,28 @@ async function currentUser(req) {
   return { id: rows[0].id, username: rows[0].username, token };
 }
 
+/* 登录暴力破解与批量注册的简单限流（内存态，重启清零） */
+const LOGIN_WINDOW = 10 * 60 * 1000, LOGIN_MAX_FAIL = 8;
+const REG_WINDOW = 60 * 60 * 1000, REG_MAX = 5;
+const loginFails = new Map(), regCounts = new Map();
+function clientIp(req) {
+  const fwd = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
+  return fwd || req.socket.remoteAddress || "unknown";
+}
+function bump(map, key, windowMs) {
+  const now = Date.now();
+  let rec = map.get(key);
+  if (!rec || now - rec.first > windowMs) rec = { first: now, count: 0 };
+  rec.count++;
+  map.set(key, rec);
+  if (map.size > 3000) for (const [k, v] of map) if (now - v.first > windowMs) map.delete(k);
+  return rec;
+}
+function blocked(map, key, windowMs, max) {
+  const rec = map.get(key), now = Date.now();
+  return !!rec && rec.count >= max && now - rec.first <= windowMs;
+}
+
 async function handleAuth(req, res, action) {
   if (action === "me") {
     if (!dbReady) return json(res, 200, { enabled: false });
@@ -173,7 +200,7 @@ async function handleAuth(req, res, action) {
     if (dbReady && token) {
       try { await pool.query("DELETE FROM sessions WHERE token=?", [token]); } catch (_) { /* ignore */ }
     }
-    clearSessionCookie(res);
+    clearSessionCookie(req, res);
     return json(res, 200, { ok: true });
   }
   if (!dbReady) return json(res, 503, { error: "MySQL 未连接，暂时无法登录" });
@@ -187,6 +214,12 @@ async function handleAuth(req, res, action) {
     if (!/^[A-Za-z0-9_\u4e00-\u9fa5.-]+$/.test(username))
       return json(res, 400, { error: "用户名只能包含中英文、数字、下划线、点和短横线" });
     if (password.length < 4 || password.length > 64) return json(res, 400, { error: "密码需 4-64 位" });
+    const ip = clientIp(req);
+    const failKey = ip + "|" + username;
+    if (action === "login" && blocked(loginFails, failKey, LOGIN_WINDOW, LOGIN_MAX_FAIL))
+      return json(res, 429, { error: "尝试次数过多，请 10 分钟后再试" });
+    if (action === "register" && blocked(regCounts, ip, REG_WINDOW, REG_MAX))
+      return json(res, 429, { error: "注册过于频繁，请稍后再试" });
     try {
       if (action === "register") {
         const [exists] = await pool.query("SELECT id FROM users WHERE username=?", [username]);
@@ -194,16 +227,20 @@ async function handleAuth(req, res, action) {
         const id = "u" + crypto.randomBytes(8).toString("hex");
         await pool.query("INSERT INTO users(id,username,pass,created) VALUES (?,?,?,?)",
           [id, username, hashPassword(password), Date.now()]);
+        bump(regCounts, ip, REG_WINDOW);
         const token = await createSession(id);
-        setSessionCookie(res, token);
+        setSessionCookie(req, res, token);
         return json(res, 200, { ok: true, user: { id, username } });
       }
       const [rows] = await pool.query("SELECT id,username,pass FROM users WHERE username=?", [username]);
-      if (!rows.length || !verifyPassword(password, rows[0].pass))
+      if (!rows.length || !verifyPassword(password, rows[0].pass)) {
+        bump(loginFails, failKey, LOGIN_WINDOW);
         return json(res, 401, { error: "用户名或密码不正确" });
+      }
+      loginFails.delete(failKey);
       await pool.query("DELETE FROM sessions WHERE expires<?", [Date.now()]);
       const token = await createSession(rows[0].id);
-      setSessionCookie(res, token);
+      setSessionCookie(req, res, token);
       return json(res, 200, { ok: true, user: { id: rows[0].id, username: rows[0].username } });
     } catch (e) {
       console.error("登录/注册失败：", e);
